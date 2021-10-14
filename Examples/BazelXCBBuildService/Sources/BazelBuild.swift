@@ -607,7 +607,7 @@ final class BazelBuild {
                         let completedActionsRange = Range(match.range(at: 1), in: message),
                         let totalActionsRange = Range(match.range(at: 3), in: message)
                     {
-                        progressMessage = String(message[finalMessageRange])
+                        progressMessage = String(message[finalMessageRange]).components(separatedBy: ";").first
                         
                         let completedActionsString = message[completedActionsRange]
                             .replacingOccurrences(of: ",", with: "")
