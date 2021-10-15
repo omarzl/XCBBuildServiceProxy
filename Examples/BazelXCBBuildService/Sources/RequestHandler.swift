@@ -22,6 +22,7 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
     
     // We use negative numbers to ensure no duplication with XCBBuildService (though it seems that doesn't matter)
     private var lastBazelBuildNumber: Int64 = 0
+    private var buildContext: BuildContext<BazelXCBBuildServiceResponsePayload>?
     
     func handleRequest(_ request: RPCRequest<BazelXCBBuildServiceRequestPayload>, context: Context) {
         // Unless `forwardRequest` is set to `false`, at the end we forward the request to XCBBuildService
@@ -76,192 +77,65 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
         }
         
         switch request.payload {
-        case let .createSession(message):
-            // We need to read the response to the request
-            shouldForwardRequest = false
-            
-            context.sendRequest(request).whenSuccess { response in
-                // Always send response back to Xcode
-                defer {
-                    context.sendResponse(response)
-                }
-                
-                guard case let .sessionCreated(payload) = response.payload else {
-                    logger.error("Expected SESSION_CREATED RPCResponse.Payload to CREATE_SESSION, instead got: \(response)")
-                    return
-                }
-                
-                let session = payload.sessionHandle
-
-                // Store the Xcode app path for later use in `CreateBuildRequest`
-                self.sessionAppPaths[session] = message.appPath
-
-                // Store the PIF cache path for later use in `CreateBuildRequest`
-                self.sessionPIFCachePaths[session] = message.cachePath + "/PIFCache"
-
-                let query = QueryXcodeVersion(appPath: message.appPath)
-                self.sessionXcodeBuildVersionFutures[session] = (query, query.start(eventLoop: context.eventLoop))
-            }
-            
-        case let .transferSessionPIFRequest(message):
-            // Store `workspaceSignature` for later parsing in `CreateBuildRequest`
-            sessionWorkplaceSignatures[message.sessionHandle] = message.workspaceSignature
-            
-        case let .setSessionUserInfo(message):
-            // At this point the PIF cache will be populated soon, so generate the Bazel target mapping
-            let session = message.sessionHandle
-            
-            sessionBazelTargetsFutures[session] = nil
-            
-            if let future = generateSessionBazelTargets(context: context, session: session) {
-                guard let appPath = sessionAppPaths[session] else {
-                    logger.error("Xcode app path not found for session “\(session)”")
-                    return
-                }
-                
-                let developerDir = "\(appPath)/Contents/Developer"
-                
-                let environment = [
-                    "DEVELOPER_APPLICATIONS_DIR": "\(developerDir)/Applications",
-                    "DEVELOPER_BIN_DIR": "\(developerDir)/usr/bin",
-                    "DEVELOPER_DIR": developerDir,
-                    "DEVELOPER_FRAMEWORKS_DIR": "\(developerDir)/Library/Frameworks",
-                    "DEVELOPER_FRAMEWORKS_DIR_QUOTED": "\(developerDir)/Library/Frameworks",
-                    "DEVELOPER_LIBRARY_DIR": "\(developerDir)/Library",
-                    "DEVELOPER_TOOLS_DIR": "\(developerDir)/Tools",
-                    "GID": String(message.gid),
-                    "GROUP": message.group,
-                    "HOME": message.home,
-                    "UID": String(message.uid),
-                    "USER": message.user,
-                ]
-                let baseEnvironment = message.buildSystemEnvironment.merging(environment) { _, new in new }
-                
-                sessionBazelTargetsFutures[session] = (baseEnvironment, future)
-            }
-            
         case let .createBuildRequest(message):
-            let session = message.sessionHandle
-            
-            // Reset in case we decide not to build
-            sessionBazelBuilds[session]?.cancel()
-            sessionBazelBuilds[session] = nil
-            
-            handleBazelTargets(session: session) { baseEnvironment, bazelTargets, xcodeBuildVersion in
-                logger.trace("Parsed targets for BazelXCBBuildService: \(bazelTargets.map { $1.name })")
-                
-                var desiredTargets: [BazelBuild.Target] = []
-                for target in message.buildRequest.configuredTargets {
-                    let guid = target.guid
-                    
-                    guard var bazelTarget = bazelTargets[guid] else {
-                        context.sendErrorResponse(
-                            "[\(session)] Parsed target not found for GUID “\(guid)”",
-                            request: request
-                        )
-                        return
-                    }
-                    
-                    // TODO: Do this check after uniquing targets, to allow excluding of "Testing" modules as well
-                    guard !BazelBuild.shouldSkipTarget(bazelTarget, buildRequest: message.buildRequest) else {
-                        logger.info("Skipping target for Bazel build: \(bazelTarget.name)")
-                        continue
-                    }
-                    
-                    bazelTarget.parameters = target.parameters
-                    
-                    desiredTargets.append(bazelTarget)
-                }
-                
-                guard BazelBuild.shouldBuild(targets: desiredTargets, buildRequest: message.buildRequest) else {
-                    // There were no bazel based targets, so we will build normally
-                    context.forwardRequest()
-                    return
-                }
-                
-                self.lastBazelBuildNumber -= 1
-                let buildNumber = self.lastBazelBuildNumber
-                
-                let buildContext = BuildContext(
-                    sendResponse: context.sendResponse,
-                    session: session,
-                    buildNumber: buildNumber,
-                    responseChannel: message.responseChannel
-                )
-                
-                do {
-                    let build = try BazelBuild(
-                        buildContext: buildContext,
-                        environment: baseEnvironment,
-                        xcodeBuildVersion: xcodeBuildVersion,
-                        developerDir: baseEnvironment["DEVELOPER_DIR"]!,
-                        buildRequest: message.buildRequest,
-                        targets: desiredTargets
-                    )
-                    
-                    self.sessionBazelBuilds[session] = build
-                    context.sendResponseMessage(BuildCreated(buildNumber: buildNumber), channel: request.channel)
-                } catch {
-                    context.sendErrorResponse(error, session: session, request: request)
-                }
-            }
-            
-        case let .buildStartRequest(message):
-            let session = message.sessionHandle
-            
-            guard let build = sessionBazelBuilds[session] else {
-                return
-            }
-            
-            // We are handling this ourselves
             shouldForwardRequest = false
+            let buildNumber: Int64 = 123
+            self.buildContext = BuildContext(
+                sendResponse: context.sendResponse,
+                session: message.sessionHandle,
+                buildNumber: buildNumber,
+                responseChannel: message.responseChannel
+            )
+            context.sendResponseMessage(BuildCreated(buildNumber: buildNumber), channel: request.channel)
             
-            do {
-                try build.start {
-                    context.sendResponseMessage(BoolResponse(true), channel: request.channel)
-                }
-            } catch {
-                context.sendErrorResponse(error, session: session, request: request)
-            }
             
-        case let .buildCancelRequest(message):
-            let session = message.sessionHandle
-        
-            guard let build = sessionBazelBuilds[session] else {
-                return
-            }
+//            let session = message.sessionHandle
+//
+//            // Reset in case we decide not to build
+//            sessionBazelBuilds[session]?.cancel()
+//            sessionBazelBuilds[session] = nil
+//
+//            handleBazelTargets(session: session) { baseEnvironment, bazelTargets, xcodeBuildVersion in
+//                logger.trace("Parsed targets for BazelXCBBuildService: \(bazelTargets.map { $1.name })")
+//
+//                message.buildRequest.configuredTargets
+//
+//                self.lastBazelBuildNumber -= 1
+//                let buildNumber = self.lastBazelBuildNumber
+//
+                
+                
+//                do {
+//                    let build = try BazelBuild(
+//                        buildContext: buildContext,
+//                        environment: baseEnvironment,
+//                        xcodeBuildVersion: xcodeBuildVersion,
+//                        developerDir: baseEnvironment["DEVELOPER_DIR"]!,
+//                        buildRequest: message.buildRequest,
+//                        targets: []
+//                    )
+//
+//                    self.sessionBazelBuilds[session] = build
+//
+//                } catch {
+//                    context.sendErrorResponse(error, session: session, request: request)
+//                }
+//            }
             
-            // We are handling this ourselves
+        case .buildStartRequest(_):
             shouldForwardRequest = false
-            
-            build.cancel()
-            
-        case let .previewInfoRequest(message):
-            let session = message.sessionHandle
-            
-            handleBazelTargets(session: session) { baseEnvironment, targets, xcodeBuildVersion in
-                do {
-                    let response = try BazelBuild.previewInfo(
-                        message,
-                        targets: targets,
-                        baseEnvironment: baseEnvironment,
-                        xcodeBuildVersion: xcodeBuildVersion
-                    )
-                    
-                    context.sendResponseMessage(PingResponse(), channel: request.channel)
-                    
-                    context.sendResponseMessage(response, channel: message.responseChannel)
-                } catch BazelBuildError.dontBuildWithBazel {
-                    // There were no bazel based targets, so we will build normally
-                    context.forwardRequest()
-                } catch {
-                    // Xcode doesn't really respond to errors 🤷‍♂️, but this will at least log something for us
-                    context.sendErrorResponse(error, session: session, request: request)
-                }
-            }
-            
+            context.sendResponseMessage(BoolResponse(true), channel: request.channel)
+            buildContext?.buildStarted()
+//            context.diagnostic(
+//                "Some targets are set to build with Bazel, but \(Target.shouldBuildWithBazelBuildSetting) and/or \(Target.bazelLabelBuildSetting) is not set for the following targets: \(nonBazelTargets.map(\.name).joined(separator: ", ")). All, or none of, the targets need to be setup to build with Bazel.",
+//                kind: .error,
+//                appendToOutputStream: true
+//            )
+            buildContext?.buildEnded(cancelled: false)
+//            buildContext?.sendErrorResponse(error, session: session, request: request)
+        case .buildCancelRequest(_):
+            shouldForwardRequest = false
         default:
-            // By default just forward the request
             break
         }
     }

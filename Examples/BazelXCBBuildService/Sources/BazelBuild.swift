@@ -672,7 +672,7 @@ enum BazelBuildError: Error {
     case targetNotFound(guid: String)
 }
 
-private extension BuildContext where ResponsePayload == BazelXCBBuildServiceResponsePayload {
+extension BuildContext where ResponsePayload == BazelXCBBuildServiceResponsePayload {
     func planningStarted() {
         sendResponseMessage(PlanningOperationWillStart(sessionHandle: session, guid: ""))
     }
