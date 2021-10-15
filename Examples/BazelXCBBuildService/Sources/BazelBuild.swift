@@ -672,98 +672,7 @@ enum BazelBuildError: Error {
     case targetNotFound(guid: String)
 }
 
-extension BuildContext where ResponsePayload == BazelXCBBuildServiceResponsePayload {
-    func planningStarted() {
-        sendResponseMessage(PlanningOperationWillStart(sessionHandle: session, guid: ""))
-    }
 
-    func planningEnded() {
-        sendResponseMessage(PlanningOperationDidFinish(sessionHandle: session, guid: ""))
-    }
-    
-    func buildStarted() {
-        sendResponseMessage(BuildOperationPreparationCompleted())
-        sendResponseMessage(BuildOperationStarted(buildNumber: buildNumber))
-        sendResponseMessage(BuildOperationReportPathMap())
-    }
-    
-    func progressUpdate(_ message: String, percentComplete: Double, showInLog: Bool = false) {
-        sendResponseMessage(
-            BuildOperationProgressUpdated(
-                targetName: nil,
-                statusMessage: message,
-                percentComplete: percentComplete,
-                showInLog: showInLog
-            )
-        )
-    }
-    
-    func buildEnded(cancelled: Bool) {
-        sendResponseMessage(BuildOperationEnded(buildNumber: buildNumber, status: cancelled ? .cancelled : .succeeded))
-    }
-    
-    func targetUpToDate(guid: String) {
-        sendResponseMessage(BuildOperationTargetUpToDate(guid: guid))
-    }
-    
-    func targetStarted(id: Int64, guid: String, targetInfo: BuildOperationTargetInfo) {
-        sendResponseMessage(BuildOperationTargetStarted(targetID: id, guid: guid, targetInfo: targetInfo))
-    }
-    
-    func targetEnded(id: Int64) {
-        sendResponseMessage(BuildOperationTargetEnded(targetID: id))
-    }
-    
-    func taskStarted(id: Int64, targetID: Int64, taskDetails: BuildOperationTaskStarted.TaskDetails) {
-        sendResponseMessage(
-            BuildOperationTaskStarted(
-                taskID: id,
-                targetID: targetID,
-                parentTaskID: nil,
-                taskDetails: taskDetails
-            )
-        )
-    }
-    
-    func consoleOutput(_ data: Data, taskID: Int64) {
-        sendResponseMessage(
-            BuildOperationConsoleOutputEmitted(
-                taskID: taskID,
-                output: data
-            )
-        )
-    }
-    
-    func diagnostic(
-        _ message: String,
-        kind: BuildOperationDiagnosticKind,
-        location: BuildOperationDiagnosticLocation = .alternativeMessage(""),
-        component: BuildOperationDiagnosticComponent = .global,
-        appendToOutputStream: Bool = false
-    ) {
-        sendResponseMessage(
-            BuildOperationDiagnosticEmitted(
-                kind: kind,
-                location: location,
-                message: message,
-                component: component,
-                unknown: "default",
-                appendToOutputStream: appendToOutputStream
-            )
-        )
-    }
-    
-    func taskEnded(id: Int64, succeeded: Bool) {
-        sendResponseMessage(
-            BuildOperationTaskEnded(
-                taskID: id,
-                status: succeeded ? .succeeded : .failed,
-                skippedErrorsFromSerializedDiagnostics: false,
-                metrics: nil
-            )
-        )
-    }
-}
 
 extension BazelBuildError: LocalizedError {
     var errorDescription: String? {
@@ -810,7 +719,7 @@ private extension BazelBuild.Target {
     }
 }
 
-private extension BuildOperationProjectInfo {
+extension BuildOperationProjectInfo {
     init(_ parsedProject: BazelBuild.Project) {
         self.init(
             name: parsedProject.name,

@@ -12,6 +12,7 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
     typealias Context = HybridXCBBuildServiceRequestHandlerContext<BazelXCBBuildServiceRequestPayload, BazelXCBBuildServiceResponsePayload>
     
     private typealias SessionHandle = String
+    private var buildContext: BuildContext<BazelXCBBuildServiceResponsePayload>?
     
     private var sessionAppPaths: [SessionHandle: String] = [:]
     private var sessionXcodeBuildVersionFutures: [SessionHandle: (Any, EventLoopFuture<String>)] = [:]
@@ -19,19 +20,9 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
     private var sessionWorkplaceSignatures: [SessionHandle: String] = [:]
     private var sessionBazelTargetsFutures: [SessionHandle: (environment: [String: String], EventLoopFuture<[String: BazelBuild.Target]?>)] = [:]
     private var sessionBazelBuilds: [SessionHandle: BazelBuild] = [:]
-    
-    // We use negative numbers to ensure no duplication with XCBBuildService (though it seems that doesn't matter)
-    private var lastBazelBuildNumber: Int64 = 0
-    private var buildContext: BuildContext<BazelXCBBuildServiceResponsePayload>?
+    private var targets = [String: BazelBuild.Target]()
     
     func handleRequest(_ request: RPCRequest<BazelXCBBuildServiceRequestPayload>, context: Context) {
-        // Unless `forwardRequest` is set to `false`, at the end we forward the request to XCBBuildService
-        var shouldForwardRequest = true
-        defer {
-            if shouldForwardRequest {
-                context.forwardRequest()
-            }
-        }
         
         func handleBazelTargets(
             session: String,
@@ -76,8 +67,83 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
             }
         }
         
+        // Unless `forwardRequest` is set to `false`, at the end we forward the request to XCBBuildService
+        var shouldForwardRequest = true
+        defer {
+            if shouldForwardRequest {
+                context.forwardRequest()
+            }
+        }
+        
         switch request.payload {
+        case let .createSession(message):
+            // We need to read the response to the request
+            shouldForwardRequest = false
+            
+            context.sendRequest(request).whenSuccess { response in
+                // Always send response back to Xcode
+                defer {
+                    context.sendResponse(response)
+                }
+                
+                guard case let .sessionCreated(payload) = response.payload else {
+                    logger.error("Expected SESSION_CREATED RPCResponse.Payload to CREATE_SESSION, instead got: \(response)")
+                    return
+                }
+                
+                let session = payload.sessionHandle
+
+                // Store the Xcode app path for later use in `CreateBuildRequest`
+                self.sessionAppPaths[session] = message.appPath
+
+                // Store the PIF cache path for later use in `CreateBuildRequest`
+                self.sessionPIFCachePaths[session] = message.cachePath + "/PIFCache"
+
+                let query = QueryXcodeVersion(appPath: message.appPath)
+                self.sessionXcodeBuildVersionFutures[session] = (query, query.start(eventLoop: context.eventLoop))
+            }
+            
+        case let .transferSessionPIFRequest(message):
+            // Store `workspaceSignature` for later parsing in `CreateBuildRequest`
+            sessionWorkplaceSignatures[message.sessionHandle] = message.workspaceSignature
+            
+        case let .setSessionUserInfo(message):
+            // At this point the PIF cache will be populated soon, so generate the Bazel target mapping
+            let session = message.sessionHandle
+            
+            sessionBazelTargetsFutures[session] = nil
+            
+            if let future = generateSessionBazelTargets(context: context, session: session) {
+                guard let appPath = sessionAppPaths[session] else {
+                    logger.error("Xcode app path not found for session “\(session)”")
+                    return
+                }
+                
+                let developerDir = "\(appPath)/Contents/Developer"
+                
+                let environment = [
+                    "DEVELOPER_APPLICATIONS_DIR": "\(developerDir)/Applications",
+                    "DEVELOPER_BIN_DIR": "\(developerDir)/usr/bin",
+                    "DEVELOPER_DIR": developerDir,
+                    "DEVELOPER_FRAMEWORKS_DIR": "\(developerDir)/Library/Frameworks",
+                    "DEVELOPER_FRAMEWORKS_DIR_QUOTED": "\(developerDir)/Library/Frameworks",
+                    "DEVELOPER_LIBRARY_DIR": "\(developerDir)/Library",
+                    "DEVELOPER_TOOLS_DIR": "\(developerDir)/Tools",
+                    "GID": String(message.gid),
+                    "GROUP": message.group,
+                    "HOME": message.home,
+                    "UID": String(message.uid),
+                    "USER": message.user,
+                ]
+                let baseEnvironment = message.buildSystemEnvironment.merging(environment) { _, new in new }
+                
+                sessionBazelTargetsFutures[session] = (baseEnvironment, future)
+            }
+            
         case let .createBuildRequest(message):
+            handleBazelTargets(session: message.sessionHandle) { baseEnvironment, bazelTargets, xcodeBuildVersion in
+                self.targets = bazelTargets
+            }
             shouldForwardRequest = false
             let buildNumber: Int64 = 123
             self.buildContext = BuildContext(
@@ -87,57 +153,150 @@ final class RequestHandler: HybridXCBBuildServiceRequestHandler {
                 responseChannel: message.responseChannel
             )
             context.sendResponseMessage(BuildCreated(buildNumber: buildNumber), channel: request.channel)
-            
-            
-//            let session = message.sessionHandle
-//
-//            // Reset in case we decide not to build
-//            sessionBazelBuilds[session]?.cancel()
-//            sessionBazelBuilds[session] = nil
-//
-//            handleBazelTargets(session: session) { baseEnvironment, bazelTargets, xcodeBuildVersion in
-//                logger.trace("Parsed targets for BazelXCBBuildService: \(bazelTargets.map { $1.name })")
-//
-//                message.buildRequest.configuredTargets
-//
-//                self.lastBazelBuildNumber -= 1
-//                let buildNumber = self.lastBazelBuildNumber
-//
-                
-                
-//                do {
-//                    let build = try BazelBuild(
-//                        buildContext: buildContext,
-//                        environment: baseEnvironment,
-//                        xcodeBuildVersion: xcodeBuildVersion,
-//                        developerDir: baseEnvironment["DEVELOPER_DIR"]!,
-//                        buildRequest: message.buildRequest,
-//                        targets: []
-//                    )
-//
-//                    self.sessionBazelBuilds[session] = build
-//
-//                } catch {
-//                    context.sendErrorResponse(error, session: session, request: request)
-//                }
-//            }
-            
         case .buildStartRequest(_):
             shouldForwardRequest = false
             context.sendResponseMessage(BoolResponse(true), channel: request.channel)
+            buildContext?.planningStarted()
+            buildContext?.progressUpdate("Hola!", percentComplete: -1)
+            buildContext?.progressUpdate("Otro mensaje con progreso 1/10", percentComplete: 10)
+            buildContext?.diagnostic("Mensaje 1️⃣", kind: .info)
+            buildContext?.diagnostic("Mensaje 2 - soy un warning", kind: .warning)
+            buildContext?.diagnostic("Mensaje 3 👋🏻", kind: .info)
+//            buildContext?.diagnostic("Mensaje 3", kind: .error)
+            buildContext?.planningEnded()
             buildContext?.buildStarted()
-//            context.diagnostic(
-//                "Some targets are set to build with Bazel, but \(Target.shouldBuildWithBazelBuildSetting) and/or \(Target.bazelLabelBuildSetting) is not set for the following targets: \(nonBazelTargets.map(\.name).joined(separator: ", ")). All, or none of, the targets need to be setup to build with Bazel.",
-//                kind: .error,
-//                appendToOutputStream: true
-//            )
+            if let target = targets.values.first(where: { $0.name == "Restaurants" }) {
+                buildContext?.targetStarted(
+                    id: 0,
+                    guid: target.xcodeGUID,
+                    targetInfo: BuildOperationTargetInfo(
+                        name: target.name,
+                        typeName: "Native",
+                        projectInfo: BuildOperationProjectInfo(target.project),
+                        configurationName: "Debug",
+                        configurationIsDefault: false,
+                        sdkRoot: nil
+                    )
+                )
+                buildContext?.taskStarted(
+                    id: 1,
+                    targetID: 0,
+                    taskDetails: BuildOperationTaskStarted.TaskDetails(
+                        taskName: "Shell Script Invocation",
+                        signature: Data(),
+                        ruleInfo: "PhaseScriptExecution Bazel\\ build xcode.sh",
+                        executionDescription: "Descripcion de algo importante aqui",
+                        commandLineDisplayString: "algo paso aqui",
+                        interestingPath: nil,
+                        serializedDiagnosticsPaths: []
+                    )
+                )
+                buildContext?.consoleOutput("Compilando...\n".data(using: .utf8)!, taskID: 1)
+                buildContext?.consoleOutput("warning: 💥\n".data(using: .utf8)!, taskID: 1)
+                buildContext?.progressUpdate("Compilando Restaurantes 🤘🏻 123/12345", percentComplete: 30)
+                buildContext?.taskEnded(id: 1, succeeded: true)
+            }
             buildContext?.buildEnded(cancelled: false)
-//            buildContext?.sendErrorResponse(error, session: session, request: request)
         case .buildCancelRequest(_):
             shouldForwardRequest = false
         default:
             break
         }
+    }
+}
+
+
+
+extension BuildContext where ResponsePayload == BazelXCBBuildServiceResponsePayload {
+    func planningStarted() {
+        sendResponseMessage(PlanningOperationWillStart(sessionHandle: session, guid: ""))
+    }
+
+    func planningEnded() {
+        sendResponseMessage(PlanningOperationDidFinish(sessionHandle: session, guid: ""))
+    }
+    
+    func buildStarted() {
+        sendResponseMessage(BuildOperationPreparationCompleted())
+        sendResponseMessage(BuildOperationStarted(buildNumber: buildNumber))
+        sendResponseMessage(BuildOperationReportPathMap())
+    }
+    
+    func progressUpdate(_ message: String, percentComplete: Double, showInLog: Bool = false) {
+        sendResponseMessage(
+            BuildOperationProgressUpdated(
+                targetName: nil,
+                statusMessage: message,
+                percentComplete: percentComplete,
+                showInLog: showInLog
+            )
+        )
+    }
+    
+    func buildEnded(cancelled: Bool) {
+        sendResponseMessage(BuildOperationEnded(buildNumber: buildNumber, status: cancelled ? .cancelled : .succeeded))
+    }
+    
+    func targetUpToDate(guid: String) {
+        sendResponseMessage(BuildOperationTargetUpToDate(guid: guid))
+    }
+    
+    func targetStarted(id: Int64, guid: String, targetInfo: BuildOperationTargetInfo) {
+        sendResponseMessage(BuildOperationTargetStarted(targetID: id, guid: guid, targetInfo: targetInfo))
+    }
+    
+    func targetEnded(id: Int64) {
+        sendResponseMessage(BuildOperationTargetEnded(targetID: id))
+    }
+    
+    func taskStarted(id: Int64, targetID: Int64, taskDetails: BuildOperationTaskStarted.TaskDetails) {
+        sendResponseMessage(
+            BuildOperationTaskStarted(
+                taskID: id,
+                targetID: targetID,
+                parentTaskID: nil,
+                taskDetails: taskDetails
+            )
+        )
+    }
+    
+    func consoleOutput(_ data: Data, taskID: Int64) {
+        sendResponseMessage(
+            BuildOperationConsoleOutputEmitted(
+                taskID: taskID,
+                output: data
+            )
+        )
+    }
+    
+    func diagnostic(
+        _ message: String,
+        kind: BuildOperationDiagnosticKind,
+        location: BuildOperationDiagnosticLocation = .alternativeMessage(""),
+        component: BuildOperationDiagnosticComponent = .global,
+        appendToOutputStream: Bool = false
+    ) {
+        sendResponseMessage(
+            BuildOperationDiagnosticEmitted(
+                kind: kind,
+                location: location,
+                message: message,
+                component: component,
+                unknown: "default",
+                appendToOutputStream: appendToOutputStream
+            )
+        )
+    }
+    
+    func taskEnded(id: Int64, succeeded: Bool) {
+        sendResponseMessage(
+            BuildOperationTaskEnded(
+                taskID: id,
+                status: succeeded ? .succeeded : .failed,
+                skippedErrorsFromSerializedDiagnostics: false,
+                metrics: nil
+            )
+        )
     }
 }
 
@@ -164,20 +323,26 @@ extension RequestHandler {
         context: Context,
         workspacePIFFuture: EventLoopFuture<WorkspacePIF>
     ) -> EventLoopFuture<Bool> {
-        return workspacePIFFuture.flatMap { [fileIO] pif in
-            let path = "\(pif.path)/xcshareddata/BazelXCBBuildServiceSettings.plist"
-            return fileIO.openFile(path: path, eventLoop: context.eventLoop)
-                .map { fileHandle, _ in
-                    // Close the file, we just wanted to ensure it exists for now
-                    // Later we might read the contents
-                    try? fileHandle.close()
-                    logger.debug("“\(path)” found. Building with Bazel.")
-                    return true
-                }.recover { error in
-                    logger.debug("“\(path)” could not be opened (\(error)). Not building with Bazel.")
-                    return false
-                }
-        }
+        //RAPPI: By default every project will be enabled, it will be filtered by the targets instead
+        let promise = context.eventLoop.makePromise(of: Bool.self)
+        promise.succeed(true)
+        return promise.futureResult
+        //RAPPI: Keeped original solution for merge/sync facilities
+
+//        return workspacePIFFuture.flatMap { [fileIO] pif in
+//            let path = "\(pif.path)/xcshareddata/BazelXCBBuildServiceSettings.plist"
+//            return fileIO.openFile(path: path, eventLoop: context.eventLoop)
+//                .map { fileHandle, _ in
+//                    // Close the file, we just wanted to ensure it exists for now
+//                    // Later we might read the contents
+//                    try? fileHandle.close()
+//                    logger.debug("“\(path)” found. Building with Bazel.")
+//                    return true
+//                }.recover { error in
+//                    logger.debug("“\(path)” could not be opened (\(error)). Not building with Bazel.")
+//                    return false
+//                }
+//        }
     }
     
     /// - Returns: parsed projects or an error, if we should build with Bazel, or `nil` if we shouldn't.
@@ -217,7 +382,10 @@ extension RequestHandler {
             }.flatMap { futures in
                 EventLoopFuture.reduce(into: [:], futures, on: context.eventLoop) { targetMappings, projectTargets in
                     for case let projectTarget in projectTargets {
-                        targetMappings[projectTarget.xcodeGUID] = projectTarget
+                        //RAPPI: We only need Bazel target since everything is wrapped in it
+//                        if projectTarget.name == "Bazel" {
+                            targetMappings[projectTarget.xcodeGUID] = projectTarget
+//                        }
                     }
                 }
             }.map { .some($0) }
